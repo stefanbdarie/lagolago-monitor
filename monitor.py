@@ -115,10 +115,14 @@ def read_recent_log(n: int = 8) -> list[dict]:
 # Notifications
 # ─────────────────────────────────────────────────────────────────────────────
 
-def send_email(subject: str, body: str) -> bool:
+def send_email(subject: str, body: str, raise_on_error: bool = False) -> bool:
+    """Send email via Gmail SMTP.
+    Set raise_on_error=True to surface failures in GitHub Actions logs."""
     if not EMAIL_APP_PASSWORD:
         print(f"  [EMAIL NOT CONFIGURED] {subject}")
         return False
+    # Strip spaces — Google shows app passwords as "xxxx xxxx xxxx xxxx"
+    password = EMAIL_APP_PASSWORD.replace(" ", "")
     try:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -127,14 +131,28 @@ def send_email(subject: str, body: str) -> bool:
         msg.attach(MIMEText(body, "plain", "utf-8"))
 
         with smtplib.SMTP("smtp.gmail.com", 587, timeout=15) as s:
+            s.ehlo()
             s.starttls()
-            s.login(EMAIL_FROM, EMAIL_APP_PASSWORD)
+            s.ehlo()
+            s.login(EMAIL_FROM, password)
             s.sendmail(EMAIL_FROM, EMAIL_TO, msg.as_string())
 
         print(f"  ✅ Email → {EMAIL_TO}: {subject}")
         return True
+    except smtplib.SMTPAuthenticationError as e:
+        msg = (
+            f"  ❌ Gmail authenticatie mislukt (535):\n"
+            f"     Controleer of EMAIL_APP_PASSWORD correct is (zonder spaties).\n"
+            f"     Fout: {e}"
+        )
+        print(msg)
+        if raise_on_error:
+            raise RuntimeError(msg) from e
+        return False
     except Exception as e:
-        print(f"  ❌ Email error: {e}")
+        print(f"  ❌ Email error ({type(e).__name__}): {e}")
+        if raise_on_error:
+            raise
         return False
 
 
@@ -153,8 +171,8 @@ def send_telegram(message: str) -> bool:
         return False
 
 
-def notify(subject: str, body: str) -> None:
-    send_email(subject, body)
+def notify(subject: str, body: str, raise_on_error: bool = False) -> None:
+    send_email(subject, body, raise_on_error=raise_on_error)
     send_telegram(f"<b>{subject}</b>\n\n{body}")
 
 
@@ -216,7 +234,7 @@ def send_status_report(ts: dict, ll: dict) -> None:
         f"{'─'*46}\n"
         f"Lago Lago Monitor · logt elke 15 minuten"
     )
-    notify(subject=f"📊 Lago Lago Status — {now}", body=body)
+    notify(subject=f"📊 Lago Lago Status — {now}", body=body, raise_on_error=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
