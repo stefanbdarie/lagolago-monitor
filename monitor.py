@@ -30,10 +30,21 @@ EMAIL_TO            = os.getenv("EMAIL_TO",    "spjwinter@gmail.com")
 TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "")
 
-PRICE_DROP_ALERT    = float(os.getenv("PRICE_DROP_ALERT", "250"))
-PRICE_HIGH_ALERT    = float(os.getenv("PRICE_HIGH_ALERT", "300"))
-LOW_STOCK_ALERT     = int(os.getenv("LOW_STOCK_ALERT",    "30"))
-SEND_STATUS_REPORT  = os.getenv("SEND_STATUS_REPORT", "false").lower() == "true"
+# Safe env helpers — GitHub Actions sets unset vars to "", not None
+def _fenv(key: str, default: float) -> float:
+    v = os.getenv(key, "").strip()
+    try: return float(v) if v else default
+    except ValueError: return default
+
+def _ienv(key: str, default: int) -> int:
+    v = os.getenv(key, "").strip()
+    try: return int(v) if v else default
+    except ValueError: return default
+
+PRICE_DROP_ALERT   = _fenv("PRICE_DROP_ALERT", 250.0)
+PRICE_HIGH_ALERT   = _fenv("PRICE_HIGH_ALERT", 300.0)
+LOW_STOCK_ALERT    = _ienv("LOW_STOCK_ALERT",  30)
+SEND_STATUS_REPORT = os.getenv("SEND_STATUS_REPORT", "false").strip().lower() == "true"
 
 TICKETSWAP_URL = os.getenv(
     "TICKETSWAP_URL",
