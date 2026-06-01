@@ -246,23 +246,42 @@ def send_status_report(ts: dict, ll: dict) -> None:
 
 def check_ticketswap() -> dict:
     """
-    Scrapes TicketSwap using Playwright (headless Chromium).
-    Falls back to requests if Playwright is unavailable.
+    Scrapes TicketSwap using Playwright with network interception.
+    Intercepts the GraphQL/JSON API response directly — bypasses bot detection.
+    Falls back to DOM scraping, then requests.
     """
     result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
 
     try:
-        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+        from playwright.sync_api import sync_playwright
     except ImportError:
+        print("  [Playwright not installed — using requests fallback]")
         return _check_ticketswap_requests()
+
+    captured_json: list[dict] = []
+
+    def handle_response(response):
+        """Intercept API/GraphQL responses that look like listing data."""
+        try:
+            url = response.url
+            if any(k in url for k in ("graphql", "api.ticketswap", "/listings", "/events")):
+                try:
+                    body = response.json()
+                    if body:
+                        captured_json.append(body)
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                      "--disable-blink-features=AutomationControlled"],
             )
-            ctx  = browser.new_context(
+            ctx = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -270,34 +289,34 @@ def check_ticketswap() -> dict:
                 ),
                 locale="nl-NL",
                 viewport={"width": 1280, "height": 900},
+                extra_http_headers={
+                    "Accept-Language": "nl-NL,nl;q=0.9",
+                    "sec-ch-ua": '"Chromium";v="123", "Not:A-Brand";v="8"',
+                    "sec-ch-ua-mobile": "?0",
+                    "sec-ch-ua-platform": '"Windows"',
+                },
             )
             page = ctx.new_page()
 
-            resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=30_000)
-            if resp and resp.status != 200:
-                result["error"] = f"HTTP {resp.status}"
-                browser.close()
-                return result
-
-            # Wait for listings or a no-listings message
-            try:
-                page.wait_for_selector(
-                    "[data-testid='listing-price'], [class*='ListingPrice'], "                    "[class*='listingprice'], [class*='price'], "                    "[data-testid='no-listings']",
-                    timeout=10_000,
-                )
-            except PWTimeout:
-                pass  # Continue — may still have data in __NEXT_DATA__
-
-            # ── Strategy 1: __NEXT_DATA__ JSON ──────────────────────────────
-            next_data = page.evaluate(
-                """() => {
-                    const el = document.getElementById('__NEXT_DATA__');
-                    try { return el ? JSON.parse(el.textContent) : null; }
-                    catch(e) { return null; }
-                }"""
+            # Remove webdriver flag
+            page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
             )
-            if next_data:
-                listings = _find_listings(next_data)
+
+            # Intercept all network responses
+            page.on("response", handle_response)
+
+            print(f"  Navigating to TicketSwap...")
+            resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=30_000)
+            print(f"  Page status: {resp.status if resp else 'unknown'}")
+
+            # Give JS time to fire API calls
+            page.wait_for_timeout(5_000)
+            print(f"  Captured {len(captured_json)} API responses")
+
+            # ── Strategy 1: parse intercepted API responses ──────────────────
+            for body in captured_json:
+                listings = _find_listings(body)
                 if listings:
                     prices = [p for p in (_extract_price(l) for l in listings) if p]
                     result.update({
@@ -306,51 +325,61 @@ def check_ticketswap() -> dict:
                         "min_price": min(prices) if prices else None,
                         "max_price": max(prices) if prices else None,
                     })
+                    print(f"  Found {len(listings)} listings via API intercept")
                     browser.close()
                     return result
 
-            # ── Strategy 2: scrape visible price text from DOM ───────────────
-            price_texts = page.evaluate(
+            # ── Strategy 2: __NEXT_DATA__ from rendered page ─────────────────
+            next_data = page.evaluate(
+                """() => { try {
+                    return JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
+                } catch(e) { return null; } }"""
+            )
+            if next_data:
+                listings = _find_listings(next_data)
+                if listings:
+                    prices = [p for p in (_extract_price(l) for l in listings) if p]
+                    result.update({
+                        "available": True, "count": len(listings),
+                        "min_price": min(prices) if prices else None,
+                        "max_price": max(prices) if prices else None,
+                    })
+                    print(f"  Found {len(listings)} listings via __NEXT_DATA__")
+                    browser.close()
+                    return result
+
+            # ── Strategy 3: scrape price text from DOM ───────────────────────
+            prices_raw = page.evaluate(
                 """() => {
-                    const texts = [];
-                    document.querySelectorAll('*').forEach(el => {
-                        const t = (el.innerText || '').trim();
-                        if (/^€\s*\d/.test(t) && t.length < 30) texts.push(t);
+                    const found = new Set();
+                    document.querySelectorAll('[class*=price],[class*=Price],[data-testid*=price]').forEach(el => {
+                        const t = el.innerText || el.textContent || '';
+                        if (t.includes('€')) found.add(t.trim());
                     });
-                    return texts;
+                    return [...found];
                 }"""
             )
             prices = []
-            for t in price_texts:
-                m = re.search(r"€\s*(\d+)[,.]( \d{2})", t)
-                if m:
+            for t in prices_raw:
+                for m in re.findall(r"(\d+)[,\.](\d{2})", t):
                     try:
-                        p = float(f"{m.group(1)}.{m.group(2).strip()}")
+                        p = float(f"{m[0]}.{m[1]}")
                         if 10 < p < 2_000:
                             prices.append(p)
                     except ValueError:
                         pass
             if prices:
-                result.update({
-                    "available": True,
-                    "min_price": min(prices),
-                    "max_price": max(prices),
-                })
-
-            # ── Strategy 3: count listing cards ─────────────────────────────
-            count = page.evaluate(
-                """() => document.querySelectorAll(
-                    '[data-testid*=listing], [class*=ListingCard], [class*=listing-card]'
-                ).length"""
-            )
-            if count:
-                result["count"]     = count
-                result["available"] = True
+                result.update({"available": True, "min_price": min(prices), "max_price": max(prices)})
+                print(f"  Found prices via DOM: {prices[:5]}")
+            else:
+                title = page.title()
+                print(f"  No price data found. Page title: {title!r}")
 
             browser.close()
 
     except Exception as e:
-        result["error"] = f"{type(e).__name__}: {e}"
+        result["error"] = f"{type(e).__name__}: {str(e)[:200]}"
+        print(f"  Playwright error: {result['error']}")
 
     return result
 
