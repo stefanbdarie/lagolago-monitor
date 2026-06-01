@@ -364,8 +364,71 @@ def _ticketswap_graphql(event_slug: str) -> dict:
         return result
 
 
+def _ticketswap_screenshot_claude(screenshot_b64: str) -> dict:
+    """Send a TicketSwap screenshot to Claude API and extract prices via vision."""
+    result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
+
+    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if not api_key:
+        result["error"] = "ANTHROPIC_API_KEY not set"
+        return result
+
+    import urllib.request as urlreq
+
+    payload = json.dumps({
+        "model": "claude-haiku-4-5-20251001",
+        "max_tokens": 300,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": screenshot_b64}
+                },
+                {
+                    "type": "text",
+                    "text": (
+                        "This is a TicketSwap ticket listing page. "
+                        "Extract all ticket prices visible (in euros). "
+                        "Return ONLY valid JSON, no other text:\n"
+                        '{"prices": [257.50, 280.00], "count": 2}\n'
+                        "If no prices visible or page is blocked:\n"
+                        '{"prices": [], "count": 0, "error": "reason"}'
+                    )
+                }
+            ]
+        }]
+    }).encode()
+
+    req = urlreq.Request("https://api.anthropic.com/v1/messages", data=payload, method="POST")
+    req.add_header("x-api-key",         api_key)
+    req.add_header("anthropic-version",  "2023-06-01")
+    req.add_header("Content-Type",       "application/json")
+
+    try:
+        with urlreq.urlopen(req, timeout=20) as r:
+            response = json.loads(r.read())
+        raw = response["content"][0]["text"].strip()
+        # Strip markdown fences if present
+        raw = re.sub(r"^```[a-z]*\n?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+        data = json.loads(raw)
+        prices = [float(p) for p in data.get("prices", []) if p]
+        if prices:
+            result.update({
+                "available": True,
+                "count":     data.get("count", len(prices)),
+                "min_price": min(prices),
+                "max_price": max(prices),
+            })
+        else:
+            result["error"] = data.get("error", "no prices in screenshot")
+    except Exception as e:
+        result["error"] = f"Claude vision: {type(e).__name__}: {str(e)[:100]}"
+    return result
+
+
 def _ticketswap_playwright() -> dict:
-    """Playwright headless browser with network interception fallback."""
+    """Playwright with screenshot + Claude vision fallback."""
     result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
     try:
         from playwright.sync_api import sync_playwright
@@ -388,17 +451,23 @@ def _ticketswap_playwright() -> dict:
                 args=["--no-sandbox", "--disable-dev-shm-usage",
                       "--disable-blink-features=AutomationControlled"],
             )
-            ctx  = browser.new_context(
-                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
+            ctx = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
                 locale="nl-NL",
+                viewport={"width": 1280, "height": 900},
             )
             page = ctx.new_page()
             page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
             page.on("response", on_response)
 
             resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=25_000)
-            page.wait_for_timeout(4_000)
+            page.wait_for_timeout(5_000)
 
+            # Strategy 1: intercepted API data
             for body in captured:
                 listings = _find_listings(body)
                 if listings:
@@ -409,7 +478,11 @@ def _ticketswap_playwright() -> dict:
                     browser.close()
                     return result
 
-            next_data = page.evaluate("""() => { try { return JSON.parse(document.getElementById('__NEXT_DATA__').textContent); } catch(e) { return null; } }""")
+            # Strategy 2: __NEXT_DATA__
+            next_data = page.evaluate("""() => {
+                try { return JSON.parse(document.getElementById('__NEXT_DATA__').textContent); }
+                catch(e) { return null; }
+            }""")
             if next_data:
                 listings = _find_listings(next_data)
                 if listings:
@@ -420,9 +493,18 @@ def _ticketswap_playwright() -> dict:
                     browser.close()
                     return result
 
-            status = resp.status if resp else 0
-            result["error"] = f"Playwright: no data (HTTP {status})"
+            # Strategy 3: screenshot → Claude vision
+            import base64
+            screenshot_b64 = base64.b64encode(page.screenshot()).decode()
             browser.close()
+
+            vision_result = _ticketswap_screenshot_claude(screenshot_b64)
+            if not vision_result.get("error"):
+                print("  TicketSwap via screenshot + Claude vision")
+                return vision_result
+
+            result["error"] = f"no data (HTTP {resp.status if resp else 0}); vision: {vision_result.get('error')}"
+
     except Exception as e:
         result["error"] = f"Playwright {type(e).__name__}: {str(e)[:100]}"
     return result
