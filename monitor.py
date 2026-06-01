@@ -53,7 +53,7 @@ PRICE_HIGH_ALERT   = _fenv("PRICE_HIGH_ALERT", 300.0)
 LOW_STOCK_ALERT    = _ienv("LOW_STOCK_ALERT",  30)
 SEND_STATUS_REPORT = os.getenv("SEND_STATUS_REPORT", "false").strip().lower() == "true"
 
-TICKETSWAP_URL = _senv("TICKETSWAP_URL", "https://www.ticketswap.nl/event/lago-lago-festival-2025/e0a8e2e0-fc15-4fab-aa77-21f86ff8cffb")
+TICKETSWAP_URL = _senv("TICKETSWAP_URL", "https://www.ticketswap.nl/event/lago-lago-2026/0a8c9317-1528-467a-8d0e-b048a6bd099b")
 LAGOLAGO_URL = "https://lagolago.nl/tickets"
 STATE_FILE   = "monitor_state.json"
 LOG_FILE     = "price_log.csv"
