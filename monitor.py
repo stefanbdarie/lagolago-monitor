@@ -245,44 +245,145 @@ def send_status_report(ts: dict, ll: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_ticketswap() -> dict:
+    """
+    Scrapes TicketSwap using Playwright (headless Chromium).
+    Falls back to requests if Playwright is unavailable.
+    """
     result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
+
+    try:
+        from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+    except ImportError:
+        return _check_ticketswap_requests()
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+            )
+            ctx  = browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/123.0.0.0 Safari/537.36"
+                ),
+                locale="nl-NL",
+                viewport={"width": 1280, "height": 900},
+            )
+            page = ctx.new_page()
+
+            resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=30_000)
+            if resp and resp.status != 200:
+                result["error"] = f"HTTP {resp.status}"
+                browser.close()
+                return result
+
+            # Wait for listings or a no-listings message
+            try:
+                page.wait_for_selector(
+                    "[data-testid='listing-price'], [class*='ListingPrice'], "                    "[class*='listingprice'], [class*='price'], "                    "[data-testid='no-listings']",
+                    timeout=10_000,
+                )
+            except PWTimeout:
+                pass  # Continue — may still have data in __NEXT_DATA__
+
+            # ── Strategy 1: __NEXT_DATA__ JSON ──────────────────────────────
+            next_data = page.evaluate(
+                """() => {
+                    const el = document.getElementById('__NEXT_DATA__');
+                    try { return el ? JSON.parse(el.textContent) : null; }
+                    catch(e) { return null; }
+                }"""
+            )
+            if next_data:
+                listings = _find_listings(next_data)
+                if listings:
+                    prices = [p for p in (_extract_price(l) for l in listings) if p]
+                    result.update({
+                        "available": True,
+                        "count":     len(listings),
+                        "min_price": min(prices) if prices else None,
+                        "max_price": max(prices) if prices else None,
+                    })
+                    browser.close()
+                    return result
+
+            # ── Strategy 2: scrape visible price text from DOM ───────────────
+            price_texts = page.evaluate(
+                """() => {
+                    const texts = [];
+                    document.querySelectorAll('*').forEach(el => {
+                        const t = (el.innerText || '').trim();
+                        if (/^€\s*\d/.test(t) && t.length < 30) texts.push(t);
+                    });
+                    return texts;
+                }"""
+            )
+            prices = []
+            for t in price_texts:
+                m = re.search(r"€\s*(\d+)[,.]( \d{2})", t)
+                if m:
+                    try:
+                        p = float(f"{m.group(1)}.{m.group(2).strip()}")
+                        if 10 < p < 2_000:
+                            prices.append(p)
+                    except ValueError:
+                        pass
+            if prices:
+                result.update({
+                    "available": True,
+                    "min_price": min(prices),
+                    "max_price": max(prices),
+                })
+
+            # ── Strategy 3: count listing cards ─────────────────────────────
+            count = page.evaluate(
+                """() => document.querySelectorAll(
+                    '[data-testid*=listing], [class*=ListingCard], [class*=listing-card]'
+                ).length"""
+            )
+            if count:
+                result["count"]     = count
+                result["available"] = True
+
+            browser.close()
+
+    except Exception as e:
+        result["error"] = f"{type(e).__name__}: {e}"
+
+    return result
+
+
+def _check_ticketswap_requests() -> dict:
+    """
+    Lightweight fallback using requests (no JS rendering — limited data)."""
+    result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": "playwright unavailable"}
     try:
         r = requests.get(TICKETSWAP_URL, headers=REQUEST_HEADERS, timeout=15)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "lxml")
-
         for tag in [soup.find("script", {"id": "__NEXT_DATA__"}),
                     *soup.find_all("script", {"type": "application/json"})]:
             if not (tag and tag.string):
                 continue
             try:
-                data     = json.loads(tag.string)
-                listings = _find_listings(data)
+                listings = _find_listings(json.loads(tag.string))
                 if listings:
                     prices = [p for p in (_extract_price(l) for l in listings) if p]
-                    result.update({
-                        "available": True, "count": len(listings),
-                        "min_price": min(prices) if prices else None,
-                        "max_price": max(prices) if prices else None,
-                    })
+                    result.update({"available": True, "count": len(listings),
+                                   "min_price": min(prices) if prices else None,
+                                   "max_price": max(prices) if prices else None,
+                                   "error": None})
                     return result
             except (json.JSONDecodeError, TypeError):
                 pass
-
         matches = re.findall(r"€\s*(\d{2,3})[.,](\d{2})", r.text)
         if matches:
-            prices = [float(f"{e}.{c}") for e, c in matches if 10 < float(f"{e}.{c}") < 2000]
+            prices = [float(f"{e}.{c}") for e, c in matches if 10 < float(f"{e}.{c}") < 2_000]
             if prices:
-                result.update({"available": True, "min_price": min(prices), "max_price": max(prices)})
-
-        m = re.search(r"(\d+)\s+(?:ticket|kaartj)", r.text, re.IGNORECASE)
-        if m:
-            result.update({"count": int(m.group(1)), "available": True})
-
-    except requests.Timeout:
-        result["error"] = "Timeout"
-    except requests.HTTPError as e:
-        result["error"] = f"HTTP {e.response.status_code}"
+                result.update({"available": True, "min_price": min(prices),
+                               "max_price": max(prices), "error": None})
     except Exception as e:
         result["error"] = str(e)
     return result
