@@ -62,7 +62,8 @@ jobs:
           TICKETSWAP_URL:      ${{ vars.TICKETSWAP_URL }}
           TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
-          SEND_STATUS_REPORT:  ${{ inputs.send_status || 'false' }}
+          # Manual trigger = always send status; schedule = only threshold alerts
+          SEND_STATUS_REPORT:  ${{ github.event_name == 'workflow_dispatch' && 'true' || 'false' }}
         run: python monitor.py
 
       # Save updated state + log for the next run
