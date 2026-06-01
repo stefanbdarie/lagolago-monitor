@@ -246,141 +246,184 @@ def send_status_report(ts: dict, ll: dict) -> None:
 
 def check_ticketswap() -> dict:
     """
-    Scrapes TicketSwap using Playwright with network interception.
-    Intercepts the GraphQL/JSON API response directly — bypasses bot detection.
-    Falls back to DOM scraping, then requests.
+    Tries three strategies to get TicketSwap listing data:
+    1. TicketSwap GraphQL API (direct, no browser)
+    2. Playwright headless browser with network intercept (fallback)
+    3. Requests-based HTML scraping (last resort)
     """
     result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
 
+    # Extract event slug from URL
+    slug_match = re.search(r"/event/([^/]+)/([^/]+)", TICKETSWAP_URL)
+    event_slug = slug_match.group(2) if slug_match else None
+
+    # ── Strategy 1: GraphQL API (no browser, no bot detection) ──────────────
+    if event_slug:
+        gql_result = _ticketswap_graphql(event_slug)
+        if not gql_result.get("error"):
+            print(f"  TicketSwap API: {gql_result.get('count','?')} listings @ €{gql_result.get('min_price','?')}")
+            return gql_result
+        print(f"  GraphQL API: {gql_result['error']} — trying Playwright...")
+
+    # ── Strategy 2: Playwright ───────────────────────────────────────────────
+    pw_result = _ticketswap_playwright()
+    if not pw_result.get("error"):
+        return pw_result
+    print(f"  Playwright: {pw_result['error']} — trying requests...")
+
+    # ── Strategy 3: Requests ─────────────────────────────────────────────────
+    return _check_ticketswap_requests()
+
+
+def _ticketswap_graphql(event_slug: str) -> dict:
+    """Query TicketSwap's public GraphQL endpoint directly."""
+    result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
+
+    # Public GraphQL endpoint used by the TicketSwap web app
+    GQL_URL = "https://api.ticketswap.com/graphql/public"
+
+    query = """
+    query GetEventListings(: ID!, : Int) {
+      node(id: ) {
+        ... on PublicEvent {
+          id
+          title
+          listings(first: , filters: { status: AVAILABLE }) {
+            totalCount
+            nodes {
+              id
+              publicListingId
+              price {
+                originalPrice { amount currency }
+                totalPriceIncludingServiceFee { amount currency }
+              }
+              status
+            }
+          }
+        }
+      }
+    }
+    """
+
+    # Build the node ID from the UUID in the URL
+    node_id = f"gid://ticketswap/Event/{event_slug}"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15",
+        "Referer": "https://www.ticketswap.nl/",
+        "Origin": "https://www.ticketswap.nl",
+    }
+
+    try:
+        r = requests.post(
+            GQL_URL,
+            json={"query": query, "variables": {"nodeId": node_id, "first": 50}},
+            headers=headers,
+            timeout=15,
+        )
+
+        if r.status_code != 200:
+            result["error"] = f"GQL HTTP {r.status_code}"
+            return result
+
+        data = r.json()
+        if "errors" in data:
+            result["error"] = f"GQL errors: {data['errors'][0].get('message','?')[:80]}"
+            return result
+
+        node = data.get("data", {}).get("node") or {}
+        listings_data = node.get("listings") or {}
+        nodes = listings_data.get("nodes") or []
+        total = listings_data.get("totalCount", 0)
+
+        if not nodes and not total:
+            result["error"] = "GQL: no listings data in response"
+            return result
+
+        prices = []
+        for listing in nodes:
+            try:
+                amt = listing["price"]["totalPriceIncludingServiceFee"]["amount"]
+                prices.append(float(amt) / 100 if float(amt) > 1000 else float(amt))
+            except (KeyError, TypeError, ValueError):
+                pass
+
+        result.update({
+            "available": True,
+            "count":     total or len(nodes),
+            "min_price": min(prices) if prices else None,
+            "max_price": max(prices) if prices else None,
+        })
+        return result
+
+    except Exception as e:
+        result["error"] = f"GQL {type(e).__name__}: {str(e)[:100]}"
+        return result
+
+
+def _ticketswap_playwright() -> dict:
+    """Playwright headless browser with network interception fallback."""
+    result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        print("  [Playwright not installed — using requests fallback]")
-        return _check_ticketswap_requests()
+        result["error"] = "playwright not installed"
+        return result
 
-    captured_json: list[dict] = []
-
-    def handle_response(response):
-        """Intercept API/GraphQL responses that look like listing data."""
+    captured: list[dict] = []
+    def on_response(resp):
         try:
-            url = response.url
-            if any(k in url for k in ("graphql", "api.ticketswap", "/listings", "/events")):
-                try:
-                    body = response.json()
-                    if body:
-                        captured_json.append(body)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+            if any(k in resp.url for k in ("graphql", "api.ticketswap", "/listings")):
+                try: captured.append(resp.json())
+                except Exception: pass
+        except Exception: pass
 
     try:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                args=["--no-sandbox", "--disable-dev-shm-usage",
                       "--disable-blink-features=AutomationControlled"],
             )
-            ctx = browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/123.0.0.0 Safari/537.36"
-                ),
+            ctx  = browser.new_context(
+                user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1",
                 locale="nl-NL",
-                viewport={"width": 1280, "height": 900},
-                extra_http_headers={
-                    "Accept-Language": "nl-NL,nl;q=0.9",
-                    "sec-ch-ua": '"Chromium";v="123", "Not:A-Brand";v="8"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                },
             )
             page = ctx.new_page()
+            page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
+            page.on("response", on_response)
 
-            # Remove webdriver flag
-            page.add_init_script(
-                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
-            )
+            resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=25_000)
+            page.wait_for_timeout(4_000)
 
-            # Intercept all network responses
-            page.on("response", handle_response)
-
-            print(f"  Navigating to TicketSwap...")
-            resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=30_000)
-            print(f"  Page status: {resp.status if resp else 'unknown'}")
-
-            # Give JS time to fire API calls
-            page.wait_for_timeout(5_000)
-            print(f"  Captured {len(captured_json)} API responses")
-
-            # ── Strategy 1: parse intercepted API responses ──────────────────
-            for body in captured_json:
+            for body in captured:
                 listings = _find_listings(body)
                 if listings:
                     prices = [p for p in (_extract_price(l) for l in listings) if p]
-                    result.update({
-                        "available": True,
-                        "count":     len(listings),
-                        "min_price": min(prices) if prices else None,
-                        "max_price": max(prices) if prices else None,
-                    })
-                    print(f"  Found {len(listings)} listings via API intercept")
+                    result.update({"available": True, "count": len(listings),
+                                   "min_price": min(prices) if prices else None,
+                                   "max_price": max(prices) if prices else None})
                     browser.close()
                     return result
 
-            # ── Strategy 2: __NEXT_DATA__ from rendered page ─────────────────
-            next_data = page.evaluate(
-                """() => { try {
-                    return JSON.parse(document.getElementById('__NEXT_DATA__').textContent);
-                } catch(e) { return null; } }"""
-            )
+            next_data = page.evaluate("""() => { try { return JSON.parse(document.getElementById('__NEXT_DATA__').textContent); } catch(e) { return null; } }""")
             if next_data:
                 listings = _find_listings(next_data)
                 if listings:
                     prices = [p for p in (_extract_price(l) for l in listings) if p]
-                    result.update({
-                        "available": True, "count": len(listings),
-                        "min_price": min(prices) if prices else None,
-                        "max_price": max(prices) if prices else None,
-                    })
-                    print(f"  Found {len(listings)} listings via __NEXT_DATA__")
+                    result.update({"available": True, "count": len(listings),
+                                   "min_price": min(prices) if prices else None,
+                                   "max_price": max(prices) if prices else None})
                     browser.close()
                     return result
 
-            # ── Strategy 3: scrape price text from DOM ───────────────────────
-            prices_raw = page.evaluate(
-                """() => {
-                    const found = new Set();
-                    document.querySelectorAll('[class*=price],[class*=Price],[data-testid*=price]').forEach(el => {
-                        const t = el.innerText || el.textContent || '';
-                        if (t.includes('€')) found.add(t.trim());
-                    });
-                    return [...found];
-                }"""
-            )
-            prices = []
-            for t in prices_raw:
-                for m in re.findall(r"(\d+)[,\.](\d{2})", t):
-                    try:
-                        p = float(f"{m[0]}.{m[1]}")
-                        if 10 < p < 2_000:
-                            prices.append(p)
-                    except ValueError:
-                        pass
-            if prices:
-                result.update({"available": True, "min_price": min(prices), "max_price": max(prices)})
-                print(f"  Found prices via DOM: {prices[:5]}")
-            else:
-                title = page.title()
-                print(f"  No price data found. Page title: {title!r}")
-
+            status = resp.status if resp else 0
+            result["error"] = f"Playwright: no data (HTTP {status})"
             browser.close()
-
     except Exception as e:
-        result["error"] = f"{type(e).__name__}: {str(e)[:200]}"
-        print(f"  Playwright error: {result['error']}")
-
+        result["error"] = f"Playwright {type(e).__name__}: {str(e)[:100]}"
     return result
 
 
