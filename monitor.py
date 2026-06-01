@@ -495,7 +495,15 @@ def _ticketswap_playwright() -> dict:
 
             # Strategy 3: screenshot → Claude vision
             import base64
-            screenshot_b64 = base64.b64encode(page.screenshot()).decode()
+            # Compress to JPEG at reduced size to stay within API limits
+            raw_png = page.screenshot(clip={"x":0,"y":0,"width":1280,"height":800})
+            from PIL import Image
+            import io
+            img = Image.open(io.BytesIO(raw_png))
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, format="JPEG", quality=60, optimize=True)
+            screenshot_b64 = base64.b64encode(buf.getvalue()).decode()
+            screenshot_mime = "image/jpeg"
             browser.close()
 
             vision_result = _ticketswap_screenshot_claude(screenshot_b64)
