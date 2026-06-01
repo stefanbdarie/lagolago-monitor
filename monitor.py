@@ -26,12 +26,17 @@ from bs4 import BeautifulSoup
 # ─────────────────────────────────────────────────────────────────────────────
 
 EMAIL_APP_PASSWORD  = os.getenv("EMAIL_APP_PASSWORD", "")
-EMAIL_FROM          = os.getenv("EMAIL_FROM",  "spjwinter@gmail.com")
-EMAIL_TO            = os.getenv("EMAIL_TO",    "spjwinter@gmail.com")
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "")
+EMAIL_FROM          = _senv("EMAIL_FROM",  "spjwinter@gmail.com")
+EMAIL_TO            = _senv("EMAIL_TO",    "spjwinter@gmail.com")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
 
 # Safe env helpers — GitHub Actions sets unset vars to "", not None
+def _senv(key: str, default: str) -> str:
+    """Return env var or default — handles empty string from unset GitHub vars."""
+    v = os.getenv(key, "").strip()
+    return v if v else default
+
 def _fenv(key: str, default: float) -> float:
     v = os.getenv(key, "").strip()
     try: return float(v) if v else default
