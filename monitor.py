@@ -21,17 +21,7 @@ from pathlib import Path
 import requests
 from bs4 import BeautifulSoup
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Configuration
-# ─────────────────────────────────────────────────────────────────────────────
 
-EMAIL_APP_PASSWORD  = os.getenv("EMAIL_APP_PASSWORD", "")
-EMAIL_FROM          = _senv("EMAIL_FROM",  "spjwinter@gmail.com")
-EMAIL_TO            = _senv("EMAIL_TO",    "spjwinter@gmail.com")
-TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
-
-# Safe env helpers — GitHub Actions sets unset vars to "", not None
 def _senv(key: str, default: str) -> str:
     """Return env var or default — handles empty string from unset GitHub vars."""
     v = os.getenv(key, "").strip()
@@ -46,6 +36,17 @@ def _ienv(key: str, default: int) -> int:
     v = os.getenv(key, "").strip()
     try: return int(v) if v else default
     except ValueError: return default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+EMAIL_APP_PASSWORD  = os.getenv("EMAIL_APP_PASSWORD", "")
+EMAIL_FROM          = _senv("EMAIL_FROM",  "spjwinter@gmail.com")
+EMAIL_TO            = _senv("EMAIL_TO",    "spjwinter@gmail.com")
+TELEGRAM_BOT_TOKEN  = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID    = os.getenv("TELEGRAM_CHAT_ID",   "").strip()
 
 PRICE_STEP         = _ienv("PRICE_STEP",        10)   # alert on every €N drop
 PRICE_HIGH_ALERT   = _fenv("PRICE_HIGH_ALERT", 300.0)
