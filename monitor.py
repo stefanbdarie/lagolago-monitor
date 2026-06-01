@@ -558,3 +558,130 @@ def check_lagolago_official() -> dict:
     return result
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# State management
+# ─────────────────────────────────────────────────────────────────────────────
+
+def load_state() -> dict:
+    try:
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def save_state(state: dict) -> None:
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2, default=str)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Alert logic  (only fires once per threshold crossing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def process_and_alert(ts: dict, ll: dict, state: dict) -> dict:
+    now       = datetime.now().strftime("%d-%m-%Y %H:%M")
+    new_state = state.copy()
+    alerts    = 0
+
+    # ── Official tickets became available ────────────────────────────────────
+    if ll["available"] and not state.get("ll_was_available"):
+        notify("🎟️ LAGOLAGO: Officiële tickets beschikbaar!",
+               f"Lago Lago verkoopt tickets via hun eigen website!\n\n"
+               f"Wees er snel bij:\n{LAGOLAGO_URL}\n\n---\n{now}  |  Lago Lago Monitor")
+        alerts += 1
+    new_state["ll_was_available"] = ll["available"]
+
+    # ── Official tickets sold out ─────────────────────────────────────────────
+    if ll["sold_out"] and not state.get("ll_was_sold_out"):
+        notify("😔 LAGOLAGO: Officiële tickets uitverkocht",
+               f"lagolago.nl is uitverkocht.\n\nHoud TicketSwap in de gaten:\n{TICKETSWAP_URL}\n\n---\n{now}  |  Lago Lago Monitor")
+        alerts += 1
+    new_state["ll_was_sold_out"] = ll["sold_out"]
+
+    # ── TicketSwap €10 band tracker ───────────────────────────────────────────
+    if ts.get("min_price") is not None:
+        p            = ts["min_price"]
+        current_band = int(math.floor(p / PRICE_STEP) * PRICE_STEP)
+        prev_band    = state.get("ts_price_band")
+
+        if prev_band is not None and current_band < prev_band:
+            for threshold in range(prev_band, current_band, -PRICE_STEP):
+                notify(
+                    f"📉 LAGOLAGO: Prijs gezakt onder €{threshold}",
+                    f"Laagste prijs op TicketSwap is gezakt onder €{threshold}!\n\n"
+                    f"  Laagste prijs nu: €{p:.2f}\n"
+                    f"  Grens gepasseerd: €{threshold}\n"
+                    f"  Aantal tickets:   {ts.get('count', '?')}\n\n"
+                    f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n---\n{now}  |  Lago Lago Monitor"
+                )
+                alerts += 1
+        new_state["ts_price_band"] = current_band
+
+        # ── Price above high threshold ────────────────────────────────────────
+        if p > PRICE_HIGH_ALERT and not state.get("ts_price_above"):
+            notify(f"📈 LAGOLAGO: Prijs gestegen boven €{PRICE_HIGH_ALERT:.0f}",
+                   f"Laagste prijs: €{p:.2f}\n\n"
+                   f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n---\n{now}  |  Lago Lago Monitor")
+            alerts += 1
+        new_state["ts_price_above"] = p > PRICE_HIGH_ALERT
+
+    # ── Low stock ─────────────────────────────────────────────────────────────
+    if ts.get("count") is not None:
+        low = ts["count"] <= LOW_STOCK_ALERT
+        if low and not state.get("ts_low_stock"):
+            notify(f"⚠️ LAGOLAGO: Nog maar {ts['count']} tickets op TicketSwap!",
+                   f"Het aanbod is bijna op!\n\n"
+                   f"  Beschikbaar:   {ts['count']} tickets\n"
+                   f"  Jouw drempel:  {LOW_STOCK_ALERT}\n"
+                   f"  Laagste prijs: €{ts.get('min_price', '?'):.2f}\n\n"
+                   f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n---\n{now}  |  Lago Lago Monitor")
+            alerts += 1
+        new_state["ts_low_stock"] = low
+
+    # ── Status log ────────────────────────────────────────────────────────────
+    ts_str = (f"€{ts['min_price']:.2f}–€{ts.get('max_price','?'):.2f} ({ts.get('count','?')} tickets)"
+              if ts.get("min_price") else f"fout: {ts.get('error','geen data')}")
+    ll_str = ("✅ beschikbaar" if ll["available"]
+              else ("❌ uitverkocht" if ll["sold_out"] else f"– {ll.get('error','?')}"))
+    print(f"  TicketSwap  → {ts_str}")
+    print(f"  lagolago.nl → {ll_str}")
+    print(f"  Alerts sent → {alerts}")
+
+    new_state.update({"last_check": now, "last_ts_min_price": ts.get("min_price"),
+                      "last_ts_count": ts.get("count"), "last_ll_available": ll.get("available")})
+    return new_state
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    now = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
+    print(f"\n{'─'*52}\n  🎟️  Lago Lago Monitor  ·  {now}\n{'─'*52}")
+
+    state = load_state()
+    print(f"  State geladen (laatste check: {state.get('last_check', 'nooit')})\n")
+
+    print("  Checking TicketSwap…")
+    ts = check_ticketswap()
+
+    print("  Checking lagolago.nl…")
+    ll = check_lagolago_official()
+
+    print()
+    log_run(ts, ll)
+    new_state = process_and_alert(ts, ll, state)
+
+    if SEND_STATUS_REPORT:
+        print("  📬 Status report aangevraagd…")
+        send_status_report(ts, ll)
+
+    save_state(new_state)
+    print(f"\n  Done ✓\n{'─'*52}\n")
+
+
+if __name__ == "__main__":
+    main()
