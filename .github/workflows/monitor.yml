@@ -1,11 +1,15 @@
 name: 🎟️ Lago Lago Monitor
 
-# Runs every 15 minutes at :07, :22, :37 and :52 past each hour.
-# Avoiding :00/:15/:30/:45 reduces GitHub queue delays.
 on:
   schedule:
     - cron: "7,22,37,52 * * * *"
-  workflow_dispatch:  # Manual trigger via Actions tab
+  workflow_dispatch:
+    inputs:
+      send_status:
+        description: 'Stuur een status-mail met de huidige situatie'
+        required: false
+        default: 'false'
+        type: boolean
 
 jobs:
   monitor:
@@ -13,57 +17,49 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1 ── Checkout code ───────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2 ── Restore state from previous run (prevents duplicate alerts) ─────
-      - name: Restore monitor state
+      # Restore both the alert-state AND the price log
+      - name: Restore state + log
         uses: actions/cache@v4
         with:
-          path: monitor_state.json
-          key: monitor-state-${{ github.run_number }}
+          path: |
+            monitor_state.json
+            price_log.csv
+          key: monitor-data-${{ github.run_number }}
           restore-keys: |
-            monitor-state-
+            monitor-data-
 
-      # 3 ── Python ──────────────────────────────────────────────────────────
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
-      # 4 ── Dependencies ────────────────────────────────────────────────────
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 5 ── Run the monitor ─────────────────────────────────────────────────
       - name: Run monitor
         env:
-          # ── Email (required) ──────────────────────────────────────────────
-          # Add EMAIL_APP_PASSWORD as a GitHub Secret:
-          # Settings → Secrets and variables → Actions → New repository secret
-          EMAIL_APP_PASSWORD: ${{ secrets.EMAIL_APP_PASSWORD }}
-          EMAIL_FROM:         ${{ vars.EMAIL_FROM }}   # default: spjwinter@gmail.com
-          EMAIL_TO:           ${{ vars.EMAIL_TO }}     # default: spjwinter@gmail.com
-
-          # ── Thresholds (set as GitHub Variables, not secrets) ──────────────
-          # Settings → Secrets and variables → Actions → Variables tab
-          PRICE_DROP_ALERT: ${{ vars.PRICE_DROP_ALERT }}  # default: 250
-          PRICE_HIGH_ALERT: ${{ vars.PRICE_HIGH_ALERT }}  # default: 300
-          LOW_STOCK_ALERT:  ${{ vars.LOW_STOCK_ALERT }}   # default: 30
-          TICKETSWAP_URL:   ${{ vars.TICKETSWAP_URL }}    # update to 2026 event URL
-
-          # ── Telegram (optional, leave empty to disable) ───────────────────
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-
+          EMAIL_APP_PASSWORD:  ${{ secrets.EMAIL_APP_PASSWORD }}
+          EMAIL_FROM:          ${{ vars.EMAIL_FROM }}
+          EMAIL_TO:            ${{ vars.EMAIL_TO }}
+          PRICE_DROP_ALERT:    ${{ vars.PRICE_DROP_ALERT }}
+          PRICE_HIGH_ALERT:    ${{ vars.PRICE_HIGH_ALERT }}
+          LOW_STOCK_ALERT:     ${{ vars.LOW_STOCK_ALERT }}
+          TICKETSWAP_URL:      ${{ vars.TICKETSWAP_URL }}
+          TELEGRAM_BOT_TOKEN:  ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:    ${{ secrets.TELEGRAM_CHAT_ID }}
+          SEND_STATUS_REPORT:  ${{ inputs.send_status || 'false' }}
         run: python monitor.py
 
-      # 6 ── Save state for the next run ────────────────────────────────────
-      - name: Save monitor state
+      # Save updated state + log for the next run
+      - name: Save state + log
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: monitor_state.json
-          key: monitor-state-${{ github.run_number }}
+          path: |
+            monitor_state.json
+            price_log.csv
+          key: monitor-data-${{ github.run_number }}
