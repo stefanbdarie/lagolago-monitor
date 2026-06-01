@@ -53,10 +53,7 @@ PRICE_HIGH_ALERT   = _fenv("PRICE_HIGH_ALERT", 300.0)
 LOW_STOCK_ALERT    = _ienv("LOW_STOCK_ALERT",  30)
 SEND_STATUS_REPORT = os.getenv("SEND_STATUS_REPORT", "false").strip().lower() == "true"
 
-TICKETSWAP_URL = os.getenv(
-    "TICKETSWAP_URL",
-    "https://www.ticketswap.nl/event/lago-lago-festival-2025/e0a8e2e0-fc15-4fab-aa77-21f86ff8cffb",
-)
+TICKETSWAP_URL = _senv("TICKETSWAP_URL", "https://www.ticketswap.nl/event/lago-lago-festival-2025/e0a8e2e0-fc15-4fab-aa77-21f86ff8cffb")
 LAGOLAGO_URL = "https://lagolago.nl/tickets"
 STATE_FILE   = "monitor_state.json"
 LOG_FILE     = "price_log.csv"
@@ -332,34 +329,52 @@ def _extract_price(listing: dict) -> float | None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_lagolago_official() -> dict:
+    """
+    Checks availability on lagolago.nl/tickets.
+    Strategy: look for BUY signals first; only mark sold-out if none found.
+    This prevents false positives when sold-out labels exist for *other* ticket types.
+    """
     result = {"available": False, "sold_out": False, "error": None}
-    SOLD_OUT_KW  = ["uitverkocht", "sold out", "sold-out", "niet meer beschikbaar",
-                    "no longer available", "tickets zijn op", "geen tickets"]
-    AVAILABLE_KW = ["bestel", "koop nu", "ticket kopen", "buy", "add to cart",
-                    "beschikbaar", "in stock", "boek"]
+
+    SOLD_OUT_KW  = ["uitverkocht", "sold out", "sold-out",
+                    "niet meer beschikbaar", "no longer available", "tickets zijn op"]
+    AVAILABLE_KW = ["bestel", "koop nu", "ticket kopen", "buy",
+                    "add to cart", "in stock", "boek", "tickets"]
+
     try:
         r = requests.get(LAGOLAGO_URL, headers=REQUEST_HEADERS, timeout=15)
         r.raise_for_status()
         text_lower = r.text.lower()
         soup = BeautifulSoup(r.text, "lxml")
 
+        # 1 ── Quantity stepper / number input → unambiguous availability ──────
+        for inp in soup.find_all("input"):
+            if inp.get("type") == "number" or "quant" in (inp.get("name") or "").lower():
+                result["available"] = True
+                return result
+
+        # 2 ── Active (non-disabled) buy/cart button ───────────────────────────
+        for tag in soup.find_all(["button", "a"]):
+            if tag.get("disabled") or tag.get("aria-disabled") == "true":
+                continue
+            tag_text = tag.get_text(separator=" ", strip=True).lower()
+            if any(kw in tag_text for kw in AVAILABLE_KW):
+                result["available"] = True
+                return result
+
+        # 3 ── Price tag + ticket/shop link ────────────────────────────────────
+        has_price = bool(soup.find(string=re.compile(r"[0-9]+,[0-9]{2}")))
+        has_link  = bool(soup.find("a", href=re.compile(
+            r"ticket|shop|bestel|cart|checkout", re.I)))
+        if has_price and has_link:
+            result["available"] = True
+            return result
+
+        # 4 ── Sold-out (only reached if NO buy signals found above) ───────────
         for kw in SOLD_OUT_KW:
             if kw in text_lower:
                 result["sold_out"] = True
                 return result
-
-        for tag in soup.find_all(["a", "button"]):
-            if tag.get("disabled") or tag.get("aria-disabled") == "true":
-                continue
-            if any(kw in tag.get_text(strip=True).lower() for kw in AVAILABLE_KW):
-                result["available"] = True
-                return result
-
-        for link in soup.find_all("a", href=True):
-            if any(k in link["href"].lower() for k in ["checkout", "shop", "bestel", "kopen"]):
-                if any(kw in link.get_text(strip=True).lower() for kw in AVAILABLE_KW):
-                    result["available"] = True
-                    return result
 
     except requests.Timeout:
         result["error"] = "Timeout"
@@ -370,140 +385,3 @@ def check_lagolago_official() -> dict:
     return result
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Alert logic
-# ─────────────────────────────────────────────────────────────────────────────
-
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE) as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
-
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2, default=str)
-
-
-
-def _get_band(price: float, step: int) -> int:
-    """Return the lower €step boundary the price sits in (e.g. 285 → 280 for step=10)."""
-    return int(math.floor(price / step) * step)
-
-
-def process_and_alert(ts: dict, ll: dict, state: dict) -> dict:
-    now       = datetime.now().strftime("%d-%m-%Y %H:%M")
-    new_state = state.copy()
-    alerts    = 0
-
-    if ll["available"] and not state.get("ll_was_available"):
-        notify("🎟️ LAGOLAGO: Officiële tickets beschikbaar!",
-               f"Lago Lago verkoopt tickets via hun eigen website!\n\n"
-               f"Wees er snel bij:\n{LAGOLAGO_URL}\n\n"
-               f"---\n{now}  |  Lago Lago Monitor")
-        alerts += 1
-    new_state["ll_was_available"] = ll["available"]
-
-    if ll["sold_out"] and not state.get("ll_was_sold_out"):
-        notify("😔 LAGOLAGO: Officiële tickets uitverkocht",
-               f"lagolago.nl is uitverkocht.\n\nHoud TicketSwap in de gaten:\n{TICKETSWAP_URL}\n\n"
-               f"---\n{now}  |  Lago Lago Monitor")
-        alerts += 1
-    new_state["ll_was_sold_out"] = ll["sold_out"]
-
-    if ts.get("min_price") is not None:
-        p = ts["min_price"]
-
-        # ── €10-band tracker: alert on every new lower band ──────────────────
-        current_band = _get_band(p, PRICE_STEP)
-        prev_band    = state.get("ts_price_band")  # None on first run
-
-        if prev_band is not None and current_band < prev_band:
-            # Price crossed one or more €PRICE_STEP boundaries downward
-            thresholds = list(range(prev_band, current_band, -PRICE_STEP))
-            for threshold in thresholds:
-                notify(
-                    subject=f"📉 LAGOLAGO: Prijs gezakt onder €{threshold}",
-                    body=(
-                        f"De laagste prijs op TicketSwap is gezakt onder €{threshold}!\n\n"
-                        f"  Laagste prijs nu: €{p:.2f}\n"
-                        f"  Grens gepasseerd: €{threshold}\n"
-                        f"  Aantal tickets:   {ts.get('count', '?')!s}\n\n"
-                        f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n"
-                        f"---\n{now}  |  Lago Lago Monitor"
-                    ),
-                )
-                alerts += 1
-
-        new_state["ts_price_band"] = current_band  # always update
-
-        if p > PRICE_HIGH_ALERT and not state.get("ts_price_above"):
-            notify(f"📈 LAGOLAGO: Prijs gestegen naar €{p:.2f}",
-                   f"Laagste prijs op TicketSwap is boven jouw drempel!\n\n"
-                   f"  Laagste prijs:   €{p:.2f}\n"
-                   f"  Jouw drempel:    €{PRICE_HIGH_ALERT:.0f}\n\n"
-                   f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n"
-                   f"---\n{now}  |  Lago Lago Monitor")
-            alerts += 1
-        new_state["ts_price_above"] = p > PRICE_HIGH_ALERT
-
-    if ts.get("count") is not None:
-        low = ts["count"] <= LOW_STOCK_ALERT
-        if low and not state.get("ts_low_stock"):
-            notify(f"⚠️ LAGOLAGO: Nog maar {ts['count']} tickets op TicketSwap!",
-                   f"Het aanbod is bijna op!\n\n"
-                   f"  Beschikbaar:   {ts['count']} tickets\n"
-                   f"  Jouw drempel:  {LOW_STOCK_ALERT} tickets\n"
-                   f"  Laagste prijs: €{ts.get('min_price','?'):.2f}\n\n"
-                   f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n"
-                   f"---\n{now}  |  Lago Lago Monitor")
-            alerts += 1
-        new_state["ts_low_stock"] = low
-
-    ts_str = (f"€{ts['min_price']:.2f}–€{ts['max_price']:.2f} ({ts.get('count','?')} tickets)"
-              if ts.get("min_price") else f"fout: {ts.get('error','geen data')}")
-    ll_str = ("✅ beschikbaar" if ll["available"]
-              else ("❌ uitverkocht" if ll["sold_out"] else f"– {ll.get('error','?')}"))
-    print(f"  TicketSwap  → {ts_str}")
-    print(f"  lagolago.nl → {ll_str}")
-    print(f"  Alerts sent → {alerts}")
-
-    new_state.update({"last_check": now, "last_ts_min_price": ts.get("min_price"),
-                      "last_ts_count": ts.get("count"), "last_ll_available": ll.get("available")})
-    return new_state
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main
-# ─────────────────────────────────────────────────────────────────────────────
-
-def main() -> None:
-    now = datetime.now().strftime("%d-%m-%Y %H:%M:%S")
-    print(f"\n{'─'*52}\n  🎟️  Lago Lago Monitor  ·  {now}\n{'─'*52}")
-
-    state = load_state()
-    print(f"  State geladen (laatste check: {state.get('last_check', 'nooit')})\n")
-
-    print("  Checking TicketSwap…")
-    ts = check_ticketswap()
-
-    print("  Checking lagolago.nl…")
-    ll = check_lagolago_official()
-
-    print()
-    log_run(ts, ll)                               # ← always log every run
-
-    new_state = process_and_alert(ts, ll, state)  # ← threshold alerts
-
-    if SEND_STATUS_REPORT:                        # ← on-demand status email
-        print("  📬 Status report aangevraagd…")
-        send_status_report(ts, ll)
-
-    save_state(new_state)
-    print(f"\n  Done ✓\n{'─'*52}\n")
-
-
-if __name__ == "__main__":
-    main()
