@@ -10,6 +10,7 @@
 import csv
 import json
 import os
+import math
 import re
 import smtplib
 from datetime import datetime
@@ -41,7 +42,7 @@ def _ienv(key: str, default: int) -> int:
     try: return int(v) if v else default
     except ValueError: return default
 
-PRICE_DROP_ALERT   = _fenv("PRICE_DROP_ALERT", 250.0)
+PRICE_STEP         = _ienv("PRICE_STEP",        10)   # alert on every €N drop
 PRICE_HIGH_ALERT   = _fenv("PRICE_HIGH_ALERT", 300.0)
 LOW_STOCK_ALERT    = _ienv("LOW_STOCK_ALERT",  30)
 SEND_STATUS_REPORT = os.getenv("SEND_STATUS_REPORT", "false").strip().lower() == "true"
@@ -202,7 +203,7 @@ def send_status_report(ts: dict, ll: dict) -> None:
         f"{'═'*46}\n\n"
         f"TICKETSWAP\n"
         f"  Prijs nu:          {ts_line}\n"
-        f"  Alert bij daling:  onder €{PRICE_DROP_ALERT:.0f}\n"
+        f"  Alert bij daling:  elke €{PRICE_STEP} stap\n"
         f"  Alert bij stijging: boven €{PRICE_HIGH_ALERT:.0f}\n"
         f"  Alert weinig stock: ≤ {LOW_STOCK_ALERT} tickets\n\n"
         f"LAGOLAGO.NL\n"
@@ -362,6 +363,12 @@ def save_state(state: dict) -> None:
         json.dump(state, f, indent=2, default=str)
 
 
+
+def _get_band(price: float, step: int) -> int:
+    """Return the lower €step boundary the price sits in (e.g. 285 → 280 for step=10)."""
+    return int(math.floor(price / step) * step)
+
+
 def process_and_alert(ts: dict, ll: dict, state: dict) -> dict:
     now       = datetime.now().strftime("%d-%m-%Y %H:%M")
     new_state = state.copy()
@@ -385,17 +392,28 @@ def process_and_alert(ts: dict, ll: dict, state: dict) -> dict:
     if ts.get("min_price") is not None:
         p = ts["min_price"]
 
-        if p < PRICE_DROP_ALERT and not state.get("ts_price_below"):
-            notify(f"📉 LAGOLAGO: Prijs gezakt naar €{p:.2f}",
-                   f"Laagste prijs op TicketSwap is gezakt!\n\n"
-                   f"  Laagste prijs:   €{p:.2f}\n"
-                   f"  Hoogste prijs:   €{ts.get('max_price','?'):.2f}\n"
-                   f"  Beschikbaar:     {ts.get('count','?')} tickets\n"
-                   f"  Jouw drempel:    €{PRICE_DROP_ALERT:.0f}\n\n"
-                   f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n"
-                   f"---\n{now}  |  Lago Lago Monitor")
-            alerts += 1
-        new_state["ts_price_below"] = p < PRICE_DROP_ALERT
+        # ── €10-band tracker: alert on every new lower band ──────────────────
+        current_band = _get_band(p, PRICE_STEP)
+        prev_band    = state.get("ts_price_band")  # None on first run
+
+        if prev_band is not None and current_band < prev_band:
+            # Price crossed one or more €PRICE_STEP boundaries downward
+            thresholds = list(range(prev_band, current_band, -PRICE_STEP))
+            for threshold in thresholds:
+                notify(
+                    subject=f"📉 LAGOLAGO: Prijs gezakt onder €{threshold}",
+                    body=(
+                        f"De laagste prijs op TicketSwap is gezakt onder €{threshold}!\n\n"
+                        f"  Laagste prijs nu: €{p:.2f}\n"
+                        f"  Grens gepasseerd: €{threshold}\n"
+                        f"  Aantal tickets:   {ts.get('count', '?')!s}\n\n"
+                        f"Bekijk TicketSwap:\n{TICKETSWAP_URL}\n\n"
+                        f"---\n{now}  |  Lago Lago Monitor"
+                    ),
+                )
+                alerts += 1
+
+        new_state["ts_price_band"] = current_band  # always update
 
         if p > PRICE_HIGH_ALERT and not state.get("ts_price_above"):
             notify(f"📈 LAGOLAGO: Prijs gestegen naar €{p:.2f}",
