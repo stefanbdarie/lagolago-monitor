@@ -266,13 +266,20 @@ def check_ticketswap() -> dict:
             return gql_result
         print(f"  GraphQL API: {gql_result['error']} — trying Playwright...")
 
-    # ── Strategy 2: Playwright ───────────────────────────────────────────────
+    # ── Strategy 2: curl_cffi (Chrome TLS impersonation) ────────────────────
+    cffi_result = _ticketswap_curl_cffi()
+    if not cffi_result.get("error"):
+        print(f"  TicketSwap via curl_cffi: {cffi_result.get('count','?')} tickets")
+        return cffi_result
+    print(f"  curl_cffi: {cffi_result['error']} — trying Playwright...")
+
+    # ── Strategy 3: Playwright + screenshot → Claude vision ──────────────────
     pw_result = _ticketswap_playwright()
     if not pw_result.get("error"):
         return pw_result
     print(f"  Playwright: {pw_result['error']} — trying requests...")
 
-    # ── Strategy 3: Requests ─────────────────────────────────────────────────
+    # ── Strategy 4: Requests (last resort) ───────────────────────────────────
     return _check_ticketswap_requests()
 
 
@@ -376,7 +383,7 @@ def _ticketswap_screenshot_claude(screenshot_b64: str) -> dict:
     import urllib.request as urlreq
 
     payload = json.dumps({
-        "model": "claude-haiku-4-5-20251001",
+        "model": "claude-sonnet-4-6",
         "max_tokens": 300,
         "messages": [{
             "role": "user",
@@ -424,6 +431,60 @@ def _ticketswap_screenshot_claude(screenshot_b64: str) -> dict:
             result["error"] = data.get("error", "no prices in screenshot")
     except Exception as e:
         result["error"] = f"Claude vision: {type(e).__name__}: {str(e)[:100]}"
+    return result
+
+
+def _ticketswap_curl_cffi() -> dict:
+    """Use curl_cffi to impersonate Chrome TLS — bypasses Cloudflare fingerprinting."""
+    result = {"available": False, "count": None, "min_price": None, "max_price": None, "error": None}
+    try:
+        from curl_cffi import requests as cffi_req
+    except ImportError:
+        result["error"] = "curl_cffi not installed"
+        return result
+
+    try:
+        headers = {
+            "Accept":           "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language":  "nl-NL,nl;q=0.9,en;q=0.8",
+            "Accept-Encoding":  "gzip, deflate, br",
+        }
+        r = cffi_req.get(
+            TICKETSWAP_URL, headers=headers,
+            impersonate="chrome120", timeout=15,
+        )
+        if r.status_code != 200:
+            result["error"] = f"curl_cffi HTTP {r.status_code}"
+            return result
+
+        import bs4 as BeautifulSoup4
+        soup = BeautifulSoup4.BeautifulSoup(r.text, "lxml")
+
+        # Try __NEXT_DATA__
+        script = soup.find("script", {"id": "__NEXT_DATA__"})
+        if script and script.string:
+            data = json.loads(script.string)
+            listings = _find_listings(data)
+            if listings:
+                prices = [p for p in (_extract_price(l) for l in listings) if p]
+                result.update({
+                    "available": True, "count": len(listings),
+                    "min_price": min(prices) if prices else None,
+                    "max_price": max(prices) if prices else None,
+                })
+                return result
+
+        # Regex fallback
+        matches = re.findall(r"€\s*(\d{2,3})[.,](\d{2})", r.text)
+        if matches:
+            prices = [float(f"{e}.{c}") for e, c in matches if 10 < float(f"{e}.{c}") < 2000]
+            if prices:
+                result.update({"available": True, "min_price": min(prices), "max_price": max(prices)})
+                return result
+
+        result["error"] = "curl_cffi: page loaded but no listing data found"
+    except Exception as e:
+        result["error"] = f"curl_cffi {type(e).__name__}: {str(e)[:100]}"
     return result
 
 
