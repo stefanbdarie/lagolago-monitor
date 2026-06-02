@@ -510,16 +510,25 @@ def _ticketswap_playwright() -> dict:
 
     try:
         with sync_playwright() as pw:
-            if not HEADLESS:
-                print("  Opening visible browser window (Cloudflare bypass)...")
-            browser = pw.chromium.launch(
+            use_chrome = USE_SYSTEM_CHROME and not HEADLESS
+            if use_chrome:
+                print("  Using system Chrome (best Cloudflare bypass)...")
+            elif not HEADLESS:
+                print("  Opening visible Chromium window...")
+
+            launch_kwargs = dict(
                 headless=HEADLESS,
                 args=[
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-blink-features=AutomationControlled",
-                ] + (["--window-size=800,600"] if not HEADLESS else []),
+                    "--disable-features=IsolateOrigins,site-per-process",
+                ] + (["--window-size=900,650"] if not HEADLESS else []),
             )
+            if use_chrome:
+                launch_kwargs["channel"] = "chrome"
+
+            browser = pw.chromium.launch(**launch_kwargs)
             ctx = browser.new_context(
                 user_agent=(
                     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
