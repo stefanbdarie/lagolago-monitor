@@ -429,6 +429,9 @@ def _ticketswap_screenshot_claude(screenshot_b64: str) -> dict:
             })
         else:
             result["error"] = data.get("error", "no prices in screenshot")
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")[:200]
+        result["error"] = f"Claude vision HTTP {e.code}: {body}"
     except Exception as e:
         result["error"] = f"Claude vision: {type(e).__name__}: {str(e)[:100]}"
     return result
@@ -525,8 +528,14 @@ def _ticketswap_playwright() -> dict:
             page.add_init_script("Object.defineProperty(navigator,'webdriver',{get:()=>undefined})")
             page.on("response", on_response)
 
-            resp = page.goto(TICKETSWAP_URL, wait_until="domcontentloaded", timeout=25_000)
-            page.wait_for_timeout(5_000)
+            # networkidle waits for Cloudflare JS challenge to complete
+            resp = page.goto(TICKETSWAP_URL, wait_until="networkidle", timeout=35_000)
+            page.wait_for_timeout(3_000)
+            # If still on challenge page, wait more
+            title = page.title()
+            if "just a moment" in title.lower() or "checking" in title.lower():
+                print(f"  Cloudflare challenge detected, waiting extra 10s...")
+                page.wait_for_timeout(10_000)
 
             # Strategy 1: intercepted API data
             for body in captured:
