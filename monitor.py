@@ -510,7 +510,7 @@ def _ticketswap_playwright() -> dict:
 
     try:
         with sync_playwright() as pw:
-            use_chrome = USE_SYSTEM_CHROME and not HEADLESS
+            use_chrome = os.getenv("USE_SYSTEM_CHROME","false").lower()=="true" and not HEADLESS
             if use_chrome:
                 print("  Using system Chrome (best Cloudflare bypass)...")
             elif not HEADLESS:
